@@ -216,6 +216,8 @@ int main(int argc, char *argv[])
                     fprintf(stderr,"Unable to open source file for reading: %s\n\n",argv[1]);
                     return E_FAIL;
                 }    
+
+                fseek(src,cur_pointer,SEEK_SET);
             }
 
             tmp[0] = 0x00;
