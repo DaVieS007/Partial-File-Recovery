@@ -6,6 +6,7 @@
     Compile with: gcc -o pfr pfr.c | clang -o pfr pfr.c
 **/
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h> 
 
@@ -153,7 +154,7 @@ int main(int argc, char *argv[])
     fprintf(stdout,"Source File Opened Successfully: %s\n",argv[1]);
     fprintf(stdout,"Destination File Opened Successfully: %s\n",argv[2]);
     fprintf(stdout,"Total Bytes to recover: %ld\n",src_size);
-    fprintf(stdout,"badBlock Try Count: %i\n",retries);
+    fprintf(stdout,"badBlock Try Count: %li\n",retries);
     fprintf(stdout,"badBlock fill char: 0x%s\n\n",fill);
 
     cur_pointer = 0;
@@ -176,7 +177,7 @@ int main(int argc, char *argv[])
             if(st != time(NULL))
             {
                 progress = (float)((double)(double)100/(double)src_size)*(double)cur_pointer;
-                fprintf(stderr,"Fast Forward | Current Block: %ld, Round Left: %i, lost: %ld, recovered: %ld, acquired: %ld, Progress: %f\n",cur_pointer,retry,badBlocks,rbadBlocks,(cur_pointer - badBlocks),progress);
+                fprintf(stderr,"Fast Forward | Current Block: %ld, Round Left: %li, lost: %ld, recovered: %ld, acquired: %ld, Progress: %f\n",cur_pointer,retry,badBlocks,rbadBlocks,(cur_pointer - badBlocks),progress);
                 st = time(NULL);
             }
 
@@ -201,7 +202,7 @@ int main(int argc, char *argv[])
             if(st != time(NULL))
             {
                 progress = (float)((double)(double)100/(double)src_size)*(double)cur_pointer;
-                fprintf(stderr,"Block Mining | Current Block: %ld, Round Left: %i, lost: %ld, recovered: %ld, acquired: %ld, Progress: %f\n",cur_pointer,retry,badBlocks,rbadBlocks,(cur_pointer - badBlocks),progress);
+                fprintf(stderr,"Block Mining | Current Block: %ld, Round Left: %li, lost: %ld, recovered: %ld, acquired: %ld, Progress: %f\n",cur_pointer,retry,badBlocks,rbadBlocks,(cur_pointer - badBlocks),progress);
                 st = time(NULL);
             }
 
@@ -280,7 +281,7 @@ int main(int argc, char *argv[])
     fclose(src);
     fclose(dst);
 
-    fprintf(stderr,"Finished | Current Block: %ld, Round Left: %i, lost: %ld, recovered: %ld, acquired: %ld, Progress: 100\n",cur_pointer,retry,badBlocks,rbadBlocks,(cur_pointer - badBlocks));
+    fprintf(stderr,"Finished | Current Block: %ld, Round Left: %li, lost: %ld, recovered: %ld, acquired: %ld, Progress: 100\n",cur_pointer,retry,badBlocks,rbadBlocks,(cur_pointer - badBlocks));
 
 
     return E_OK;
