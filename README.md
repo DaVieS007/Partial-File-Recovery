@@ -30,6 +30,9 @@ Also if the block **could not be recovered** the software **will fill a specifie
 [25383.756537] blk_update_request: I/O error, dev vda, sector 106469896
 ````
 
+## Compilation
+* `gcc -o pfr pfr.c` or `clang -o pfr pfr.c`
+
 ## Usage
 ````
 [P]artial [F]ile [R]ecovery Version: 1.0r
