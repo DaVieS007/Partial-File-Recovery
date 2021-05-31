@@ -12,7 +12,7 @@
 
 #define E_OK 0
 #define E_FAIL 1
-#define VERSION "1.0r"
+#define VERSION "1.2r"
 #define true 1
 #define false 0
 
@@ -48,6 +48,7 @@ int main(int argc, char *argv[])
     bool badBlock;
     bool readAhead;
     int clean;
+    int emulate_badsector = 0;
 
     fill[0] = 0x00;
     strcat(fill,"00");
@@ -161,6 +162,7 @@ int main(int argc, char *argv[])
     fseek(src,0,SEEK_SET);
     readAhead = true;
 
+
     while(true)
     {
         success = false;
@@ -174,6 +176,13 @@ int main(int argc, char *argv[])
 
         if(readAhead && (cur_pointer + 65536) < src_size)
         {
+            if(buff.slen > 0)
+            {
+                fwrite(buff.buffer,1,buff.slen,dst);
+                buff.slen = 0;
+                buff.buffer[0] = 0x00;
+            }
+
             if(st != time(NULL))
             {
                 progress = (float)((double)(double)100/(double)src_size)*(double)cur_pointer;
@@ -183,22 +192,33 @@ int main(int argc, char *argv[])
 
             tmp[0] = 0x00;
             slen = fread (tmp, 1, 65536, src);
-            if(slen == 65536)
-            {
-                fwrite(tmp,1,65536,dst);
-                cur_pointer = ftell(src);
-                continue;
-            }            
-            else
+            if(emulate_badsector > 0 && cur_pointer > emulate_badsector && cur_pointer < (emulate_badsector + 262144))
             {
                 fseek(src,cur_pointer,SEEK_SET);
                 readAhead = false;
                 clean = 0;
             }
+            else
+            {
+                if(slen == 65536)
+                {
+                    fwrite(tmp,1,65536,dst);
+                    cur_pointer = ftell(src);
+                    continue;
+                }            
+                else
+                {
+                    fseek(src,cur_pointer,SEEK_SET);
+                    readAhead = false;
+                    clean = 0;
+                }
+            }
         }
 
         while(retry--)
         {
+            fseek(src,cur_pointer,SEEK_SET);
+
             if(st != time(NULL))
             {
                 progress = (float)((double)(double)100/(double)src_size)*(double)cur_pointer;
@@ -222,30 +242,38 @@ int main(int argc, char *argv[])
 
             tmp[0] = 0x00;
             slen = fread (tmp, 1, 1, src);
-            if(slen == 1)
-            {
-                buff.buffer[buff.slen] = tmp[0];
-                buff.slen++;
-
-                if(buff.slen >= 65536) // 64K CACHING !!
-                {
-                    fwrite(buff.buffer,buff.slen,1,dst); 
-                    buff.slen = 0;
-                    buff.buffer[0] = 0x00;
-                }
-
-                success = true;
-                clean++;
-                break;
-            }
-            else
+            if(emulate_badsector > 0 && cur_pointer > emulate_badsector && cur_pointer < (emulate_badsector + 262144))
             {
                 badBlock = true;
                 continue;
             }
+            else
+            {
+                if(slen == 1)
+                {
+                    buff.buffer[buff.slen] = tmp[0];
+                    buff.slen++;
+
+                    if(buff.slen >= 65536) // 64K CACHING !!
+                    {
+                        fwrite(buff.buffer,1,buff.slen,dst); 
+                        buff.slen = 0;
+                        buff.buffer[0] = 0x00;
+                    }
+
+                    success = true;
+                    clean++;
+                    break;
+                }
+                else
+                {
+                    badBlock = true;
+                    continue;
+                }
+            }
         }
 
-        if(!success)
+        if(success == false)
         {
             clean = 0;
             badBlocks++;
@@ -269,12 +297,11 @@ int main(int argc, char *argv[])
         {
             break;
         }
-        fseek(src,cur_pointer,SEEK_SET);
     }
 
-    if(buff.slen >= 0)
+    if(buff.slen > 0)
     {
-        fwrite(buff.buffer,1,buff.slen,dst); 
+        fwrite(buff.buffer,1,buff.slen,dst);
         buff.slen = 0;
         buff.buffer[0] = 0x00;
     }
