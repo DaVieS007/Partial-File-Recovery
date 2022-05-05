@@ -123,12 +123,12 @@ int main(int argc, char *argv[])
 
     if(argc >= 8)
     {
-        limit = atoi(argv[7]);
+        limit = strtoull(argv[7],NULL,10);
     }
 
     if(argc >= 7)
     {
-        seek = atoi(argv[6]);
+        seek = strtoull(argv[6],NULL,10);
     }
 
     if(argc >= 6)
