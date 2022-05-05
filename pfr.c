@@ -13,7 +13,7 @@
 
 #define E_OK 0
 #define E_FAIL 1
-#define VERSION "1.6r"
+#define VERSION "1.8r"
 #define true 1
 #define false 0
 #define BUFFSZ 1048576
@@ -202,10 +202,17 @@ int main(int argc, char *argv[])
     dst = fopen (argv[2],"r+");
     if (dst == NULL)
     {
-        fprintf(stderr,"Unable to open destination file for writing: %s\n\n",argv[2]);
-        fclose (src);
-        return E_FAIL;
-    }  
+        dst = fopen (argv[2],"w");
+        if (dst == NULL)
+        {
+            fprintf(stderr,"Unable to open destination file for writing: %s\n\n",argv[2]);
+            fclose (src);
+            return E_FAIL;
+        }  
+
+    }
+
+
 
     MBUFF[0] = 0x00;
     setvbuf(dst, MBUFF, _IOFBF, MBUFFSIZE);  
