@@ -78,12 +78,11 @@ To copy changes only (differential copy) from file1 into file2 ./pfr64 ./file1.i
 ````
 
 ## Sample Output
-````
-![image](/screens/scr1.png)
 
-![image](/screens/scr2.png)
+![screenshot1](screens/scr1.png "Usage Sample")
 
-````
+![screenshot2](screens/scr2.png "Usage Sample")
+
 
 ## Under License
 ### GNU/GPLv3
