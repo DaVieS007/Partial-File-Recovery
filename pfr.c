@@ -19,7 +19,7 @@
 
 #define EXIT_OK 0
 #define EXIT_FAIL 1
-#define VERSION "2.0r"
+#define VERSION "2.1r"
 #define true 1
 #define false 0
 #define BUFFSZ 10485760
@@ -98,6 +98,9 @@ int main(int argc, char *argv[])
     bool skip_write = false;
     int cc = 0;
 
+    tmp = malloc(BUFFSZ*2);
+    tmp2 = malloc(BUFFSZ*2);
+
     signal(SIGINT, signalHandler);
 
     /** ENABLE COLORED OUTPUT ON WINDOWS **/
@@ -152,17 +155,17 @@ int main(int argc, char *argv[])
         fprintf(stderr,"Fast Forward |             0 |          0 |           0 |           0 |             0 |              0  |  0.00, 0 MB/s\n");
         fprintf(stderr,"Fast Forward |     230686720 |          0 |           0 |           0 |             0 |      230686720  |  11.59, 220 MB/s\n\n");
 
-        fprintf(stderr,"\033[1m[Examples to acquire damaged file]\033[m\n",argv[0]);
+        fprintf(stderr,"\033[1m[Examples to acquire damaged file]\033[m\n");
         fprintf(stderr,"To rescue a single file: %s ./broken_file.mp3 ./broken_file_fix.mp3\n",argv[0]);
         fprintf(stderr,"To rescue mySQL ibd: %s ./important_tbl.ibd ./important_tbl.ibd.bck\n",argv[0]);
         fprintf(stderr,"To rescue text file: %s ./mail.txt ./mail.txt.bck 0 0 1 20\n",argv[0]);
 
-        fprintf(stderr,"\n\033[1m[Examples to rescue whole block device]\033[m\n",argv[0]);
+        fprintf(stderr,"\n\033[1m[Examples to rescue whole block device]\033[m\n");
         fprintf(stderr,"To rescue a 4K Sata BAD drive: %s /dev/sda /dev/sdb 0 0 1 00 4096\n",argv[0]);
         fprintf(stderr,"To rescue a 512B Sata partition: %s /dev/sda1 /dev/sdb1 0 0 1 00 512\n",argv[0]);
         fprintf(stderr,"To rescue a 512B Sata partition with limit of 22MB/s: %s /dev/sda1 /dev/sdb1 0 22 1 00 512\n",argv[0]);
 
-        fprintf(stderr,"\n\033[1m[Example of differential method]\033[m\n",argv[0]);
+        fprintf(stderr,"\n\033[1m[Example of differential method]\033[m\n");
         fprintf(stderr,"To copy changes only (differential copy) from file1 into file2 %s ./file1.img.old ./file2.img 1\n",argv[0]);
 
         return EXIT_FAIL;
@@ -291,8 +294,6 @@ int main(int argc, char *argv[])
     }
 
 
-    tmp = malloc(BUFFSZ*2);
-    tmp2 = malloc(BUFFSZ*2);
     MBUFF = malloc(MBUFFSIZE);
     buff.buffer = malloc(BUFFSZ*2);
 
@@ -348,7 +349,7 @@ int main(int argc, char *argv[])
 
     if(slimit > 0)
     {
-        fprintf(stdout,"Speed Throttle: %d MB/s\n",slimit);
+        fprintf(stdout,"Speed Throttle: %ld MB/s\n",slimit);
     }
 
     if(limit > 0)
@@ -375,9 +376,9 @@ int main(int argc, char *argv[])
         {
             if(buff.slen > 0)
             {
-                if(fwrite(buff.buffer,1,buff.slen,dst) != buff.slen);
+                if(fwrite(buff.buffer,1,buff.slen,dst) != buff.slen)
                 {
-                    fprintf(stderr,"Failed to Write Destination [1] %lu!",buff.slen);
+                    fprintf(stderr,"Failed to Write Destination [1] %d!",buff.slen);
 
                     free(tmp);
                     free(tmp2);
@@ -419,7 +420,7 @@ int main(int argc, char *argv[])
                 }
 
                 progress = (float)((double)(double)100/(double)src_size)*(double)cur_pointer;
-                fprintf(stdout,"Fast Forward | %13ld | %10i | %11ld | %11ld | %13ld |  %13ld  |  %.2f, %d MB/s\n",cur_pointer,(retry - 1),badBlocks,rbadBlocks,writes,(cur_pointer - badBlocks),progress,MBPS);
+                fprintf(stdout,"Fast Forward | %13ld | %10li | %11ld | %11ld | %13ld |  %13ld  |  %.2f, %d MB/s\n",cur_pointer,(retry - 1),badBlocks,rbadBlocks,writes,(cur_pointer - badBlocks),progress,MBPS);
                 st = time(NULL);
                 if(slimit > 0)
                 {
@@ -546,7 +547,7 @@ int main(int argc, char *argv[])
             if(st != time(NULL))
             {
                 progress = (float)((double)(double)100/(double)src_size)*(double)cur_pointer;
-                fprintf(stdout,"Block Mining | %13ld | %10i | %11ld | %11ld | %13ld |  %13ld  |  %.2f, -- MB/s\n",cur_pointer,(retry - 1),badBlocks,rbadBlocks,writes,(cur_pointer - badBlocks),progress);
+                fprintf(stdout,"Block Mining | %13ld | %10li | %11ld | %11ld | %13ld |  %13ld  |  %.2f, -- MB/s\n",cur_pointer,(retry - 1),badBlocks,rbadBlocks,writes,(cur_pointer - badBlocks),progress);
                 st = time(NULL);
             }
 
@@ -679,7 +680,7 @@ int main(int argc, char *argv[])
     {
         if(fwrite(buff.buffer,1,buff.slen,dst) != buff.slen)
         {
-            fprintf(stderr,"Failed to Write Destination [1] %lu!",buff.slen);
+            fprintf(stderr,"Failed to Write Destination [1] %d!",buff.slen);
             free(tmp);
             free(tmp2);
             free(MBUFF);
@@ -700,7 +701,7 @@ int main(int argc, char *argv[])
     fclose(src);
     fclose(dst);
 
-    fprintf(stderr,"Finished     | %13ld | %10i | %11ld | %11ld | %13ld |  %13ld  |  %.2f, -- MB/s\n",cur_pointer,(retry - 1),badBlocks,rbadBlocks,writes,(cur_pointer - badBlocks),100.00);
+    fprintf(stderr,"Finished     | %13ld | %10li | %11ld | %11ld | %13ld |  %13ld  |  %.2f, -- MB/s\n",cur_pointer,(retry - 1),badBlocks,rbadBlocks,writes,(cur_pointer - badBlocks),100.00);
 
     free(tmp);
     free(tmp2);
