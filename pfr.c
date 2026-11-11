@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <errno.h>
 
 typedef int64_t _long;
 
@@ -55,7 +56,12 @@ typedef int64_t _long;
 
     #define FSEEK _fseeki64
     #define FTELL _ftelli64
+
+    /* the C runtime keeps the last Windows error in _doserrno: reset it so reports are never stale */
+    #define CLEAR_OS_ERROR() do { errno = 0; _doserrno = 0; } while(0)
 #else
+    #define CLEAR_OS_ERROR() do { errno = 0; } while(0)
+
     #include <unistd.h>
 
     #define FSEEK fseeko
@@ -73,6 +79,7 @@ typedef int64_t _long;
 #define CLEAN_BYTES 4096          /* good bytes in a row before returning to Fast Forward */
 #define MAX_JUMP_SHIFT 11         /* largest skip-ahead: 2^11 = 2048 sectors */
 #define MAX_LIST_RANGES 100       /* bad ranges printed in the final report */
+#define DIFF_BLOCK 65536          /* differential mode compares and writes in blocks of this size */
 #ifndef CKPT_MS
     #define CKPT_MS 30000         /* save the map file this often while running */
 #endif
@@ -86,6 +93,9 @@ typedef int64_t _long;
 #endif
 #ifndef PFR_EMULATE_FLAKY
     #define PFR_EMULATE_FLAKY 0   /* 1 = first half of the bad area becomes readable in Pass 3 */
+#endif
+#ifndef PFR_TEST_HEAD
+    #define PFR_TEST_HEAD 0       /* defer the first 1 MB like on a physical drive, on plain files */
 #endif
 #ifndef PFR_TEST_ALIGN
     #define PFR_TEST_ALIGN 0      /* force raw-device alignment rules on plain files */
@@ -155,6 +165,7 @@ static _long st_acquired = 0;     /* bytes read successfully */
 static _long st_lost = 0;         /* bytes currently bad or skipped (filled) */
 static _long st_recovered = 0;    /* bytes rescued by Pass 2 / Pass 3 */
 static _long st_read_errors = 0;  /* failed read calls the drive had to endure */
+static _long st_unchanged = 0;    /* differential: bytes already identical in the destination, not written */
 
 /* Map file */
 static int    g_argc = 0;
@@ -278,6 +289,7 @@ static void die(const char *msg)
 #define MAX_LOCKED 64
 static HANDLE locked_vols[MAX_LOCKED];
 static int    n_locked = 0;
+static int    g_dst_disk = -1;    /* PhysicalDrive number of a raw disk destination, -1 otherwise */
 
 /** Detect \\.\  or  //./ device paths **/
 static int is_device_path(const char *path)
@@ -455,6 +467,7 @@ static FILE *open_device(const char *path, int want_write)
             if(disk >= 0)
             {
                 lock_disk_volumes(disk);
+                g_dst_disk = disk;
             }
         }
     }
@@ -846,10 +859,262 @@ static _long read_at(_long pos, char *buf, _long len)
     return (_long)got;
 }
 
+/**
+ *  Fatal destination write error with the reason: position, C library error
+ *  and on Windows the system error code, its text and a hint for the usual causes.
+ *  (The last saved map file stays usable to continue later.)
+ */
+static void die_write(_long pos, _long len, int err)
+{
+    char msg[1024];
+
+#ifdef _WIN32
+    unsigned long werr = (unsigned long)_doserrno;
+    char wtxt[256];
+    const char *hint = "";
+
+    wtxt[0] = 0;
+    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, (DWORD)werr,
+                   0, wtxt, sizeof(wtxt), NULL);
+    rtrim(wtxt);
+    CharToOemA(wtxt, wtxt);     /* system messages come in the ANSI code page, the console shows OEM */
+
+    switch(werr)
+    {
+        case ERROR_WRITE_PROTECT:
+        {
+            hint = "\nThe drive is write-protected. Check its lock switch. Many USB sticks switch to permanent read-only mode when their flash wears out;"
+                   "\nif diskpart \"attributes disk\" shows it read-only and \"attributes disk clear readonly\" does not help, the stick is worn out.";
+            break;
+        }
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+        {
+            hint = "\nThe drive or one of its volumes is in use. Close Explorer windows and programs using it, run as Administrator,"
+                   "\nor wipe its partition table with diskpart (select disk N, clean) and try again.";
+            break;
+        }
+        case ERROR_CRC:
+        case ERROR_IO_DEVICE:
+        case ERROR_GEN_FAILURE:
+        case ERROR_SECTOR_NOT_FOUND:
+        {
+            hint = "\nThe drive reports a hardware error, it is probably failing.";
+            break;
+        }
+        case ERROR_DEVICE_REMOVED:
+        case ERROR_NOT_READY:
+        case ERROR_DEVICE_NOT_CONNECTED:
+        {
+            hint = "\nThe drive disconnected or reset during the write. Try another USB port or cable.";
+            break;
+        }
+        case ERROR_INVALID_PARAMETER:
+        {
+            hint = "\nThe drive rejected the request, check that skip / seek are multiples of its sector size.";
+            break;
+        }
+        case ERROR_INVALID_FUNCTION:
+        {
+            hint = "\nWindows refused the write even after removing the partition table. Wipe the drive with diskpart"
+                   "\n(select disk N, clean), unplug and replug it, then try again.";
+            break;
+        }
+        default:
+        {
+            break;
+        }
+    }
+
+    snprintf(msg, sizeof(msg), "Failed to Write Destination at byte %" PRId64 " (%" PRId64 " bytes): %s, Windows error %lu: %s%s",
+             pos, len, strerror(err), werr, wtxt, hint);
+#else
+    snprintf(msg, sizeof(msg), "Failed to Write Destination at byte %" PRId64 " (%" PRId64 " bytes): %s",
+             pos, len, strerror(err));
+#endif
+
+    die(msg);
+}
+
+#define LAYOUT_FIX_BYTES 1048576  /* area at the start and end of a disk that holds MBR / GPT */
+#define MAX_RECOVERIES 20
+
+/*
+ *  Deferred start area of a physical drive destination.
+ *  As soon as an image's partition table lands on the disk, Windows reads it,
+ *  mounts the new partitions and blocks raw writes into them. So the first
+ *  LAYOUT_FIX_BYTES (MBR + GPT) are collected in head_buf during the copy and
+ *  written once at the very end. head_buf starts with the disk's own content,
+ *  so areas that are never written (differential mode) stay as they were.
+ */
+static char *head_buf = NULL;
+static _long head_len = 0;        /* 0 = not deferring */
+static bool  head_pending = false;
+
+#if defined(_WIN32) || PFR_TEST_HEAD > 0
+static void head_init(_long disk_size)
+{
+    _long n = LAYOUT_FIX_BYTES;
+
+    if(disk_size > 0 && disk_size < n)
+    {
+        n = disk_size - (disk_size % align);
+    }
+
+    head_buf = (char *)abuf_alloc(LAYOUT_FIX_BYTES + IO_ALIGN);
+    if(head_buf == NULL)
+    {
+        die("Out of memory");
+    }
+
+    CLEAR_OS_ERROR();
+    if(n <= 0 || FSEEK(dst, 0, SEEK_SET) != 0 || (_long)fread(head_buf, 1, (size_t)n, dst) != n)
+    {
+        fprintf(stderr, "\033[93mWarning: cannot read the start of the drive, its partition table is written first\033[m\n");
+        clearerr(dst);
+        return;
+    }
+    clearerr(dst);
+
+    head_len = n;
+    fprintf(stdout, "The partition table area (first %" PRId64 " bytes) is written last, so Windows does not mount partitions during the write\n", head_len);
+}
+#endif
+
+#ifdef _WIN32
+
+/**
+ *  After the partition layout was removed, put the image's own data back into
+ *  the start / end areas of the disk that were already written before pos.
+ */
+static void rewrite_layout_area(_long a, _long b)
+{
+    static char *fix_buf = NULL;
+
+    if(fix_buf == NULL)
+    {
+        fix_buf = (char *)abuf_alloc(LAYOUT_FIX_BYTES + IO_ALIGN);
+        if(fix_buf == NULL)
+        {
+            die("Out of memory");
+        }
+    }
+
+    while(a < b)
+    {
+        _long n = b - a;
+        _long got;
+        _long wlen;
+
+        if(n > LAYOUT_FIX_BYTES)
+        {
+            n = LAYOUT_FIX_BYTES;
+        }
+
+        got = read_at(a, fix_buf, n);
+        got -= got % align;
+        if(got <= 0)
+        {
+            fprintf(stderr, "\033[93mWarning: cannot re-read the source at %" PRId64 " to restore it after removing the partition table\033[m\n", a);
+            a += n;
+            continue;
+        }
+
+        wlen = got;
+        CLEAR_OS_ERROR();
+        if(FSEEK(dst, a, SEEK_SET) != 0 || fwrite(fix_buf, 1, (size_t)wlen, dst) != (size_t)wlen)
+        {
+            die_write(a, wlen, errno);
+        }
+        st_written += wlen;
+        a += got;
+    }
+}
+
+/**
+ *  Windows blocked a raw write to a physical drive ("access denied").
+ *  Attempt 0: lock volumes that appeared on the drive meanwhile.
+ *  Attempt 1: remove the drive's partition layout (GPT / MBR, like "diskpart clean"),
+ *             let Windows re-read it, and restore the image's start / end areas.
+ *  Returns true when the write is worth retrying.
+ */
+static bool recover_blocked_write(_long pos, int attempt)
+{
+    static int recoveries = 0;
+    HANDLE h;
+    DWORD unused;
+    _long disk_size;
+
+    if(!dst_is_device || g_dst_disk < 0 || recoveries >= MAX_RECOVERIES)
+    {
+        return false;
+    }
+
+    /* blocked writes show up as "access denied" or as "incorrect function" (invalid device request) */
+    if((unsigned long)_doserrno != ERROR_ACCESS_DENIED && (unsigned long)_doserrno != ERROR_INVALID_FUNCTION)
+    {
+        return false;
+    }
+
+    recoveries++;
+    h = (HANDLE)_get_osfhandle(_fileno(dst));
+
+    if(attempt == 0)
+    {
+        fprintf(stderr, "\n\033[93mWindows blocked the write at byte %" PRId64 ": locking volumes that appeared on PhysicalDrive%d and retrying\033[m\n",
+                pos, g_dst_disk);
+        lock_disk_volumes(g_dst_disk);
+        return true;
+    }
+
+    if(attempt == 1)
+    {
+        fprintf(stderr, "\033[93mWindows still blocks the write: removing the old partition table (GPT / MBR) of PhysicalDrive%d and retrying\033[m\n",
+                g_dst_disk);
+
+        if(!DeviceIoControl(h, IOCTL_DISK_DELETE_DRIVE_LAYOUT, NULL, 0, NULL, 0, &unused, NULL))
+        {
+            CREATE_DISK cd;
+
+            memset(&cd, 0, sizeof(cd));
+            cd.PartitionStyle = PARTITION_STYLE_RAW;
+            if(!DeviceIoControl(h, IOCTL_DISK_CREATE_DISK, &cd, sizeof(cd), NULL, 0, &unused, NULL))
+            {
+                fprintf(stderr, "\033[91mUnable to remove the partition table (Windows error %lu)\033[m\n", (unsigned long)GetLastError());
+                return false;
+            }
+        }
+        DeviceIoControl(h, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &unused, NULL);
+
+        /* the layout lives in the first and last sectors: restore what the image already had there */
+        if(head_len > 0)
+        {
+            head_pending = true;    /* the whole start area is written from head_buf at the end */
+        }
+        else if(pos > 0)
+        {
+            rewrite_layout_area(0, (pos < LAYOUT_FIX_BYTES) ? pos : LAYOUT_FIX_BYTES);
+        }
+
+        disk_size = device_size(dst);
+        if(disk_size > LAYOUT_FIX_BYTES && pos > disk_size - LAYOUT_FIX_BYTES)
+        {
+            rewrite_layout_area(disk_size - LAYOUT_FIX_BYTES, (pos < src_size) ? pos : src_size);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+#endif /* _WIN32 */
+
 /** Write len bytes at pos; pads to a whole sector on raw drives (data needs room for it) **/
 static void write_at(_long pos, char *data, _long len)
 {
     _long wlen = len;
+    int attempt;
 
     if(dst_raw && (wlen % align) != 0)
     {
@@ -858,25 +1123,88 @@ static void write_at(_long pos, char *data, _long len)
         wlen += pad;
     }
 
-    if(FSEEK(dst, pos, SEEK_SET) != 0)
+    /* Start area of a physical drive: keep it in memory, written by flush_head() at the end */
+    if(head_len > 0 && pos < head_len)
     {
-        die("Failed to seek Destination!");
+        _long n = head_len - pos;
+
+        if(n > wlen)
+        {
+            n = wlen;
+        }
+
+        memcpy(head_buf + pos, data, (size_t)n);
+        head_pending = true;
+        pos += n;
+        data += n;
+        wlen -= n;
+
+        if(wlen == 0)
+        {
+            return;
+        }
     }
 
-    if(fwrite(data, 1, (size_t)wlen, dst) != (size_t)wlen)
+    for(attempt = 0; ; attempt++)
     {
-        die("Failed to Write Destination!");
+        bool ok;
+        int err;
+
+        /* seeking flushes buffered data of a file destination, so it can fail with a write error too */
+        CLEAR_OS_ERROR();
+        ok = (FSEEK(dst, pos, SEEK_SET) == 0);
+        if(ok)
+        {
+            ok = (fwrite(data, 1, (size_t)wlen, dst) == (size_t)wlen);
+        }
+
+        if(ok)
+        {
+            break;
+        }
+
+        err = errno;
+        clearerr(dst);
+
+#ifdef _WIN32
+        if(recover_blocked_write(pos, attempt))
+        {
+            continue;
+        }
+#else
+        (void)attempt;
+#endif
+
+        errno = err;
+        die_write(pos, wlen, err);
     }
 
     st_written += wlen;
 }
 
+/** Write the deferred start area (partition table) of a physical drive, at the very end **/
+static void flush_head(void)
+{
+    _long n = head_len;
+
+    if(n == 0 || !head_pending)
+    {
+        return;
+    }
+
+    head_len = 0;                 /* stop deferring: this write goes to the disk */
+    head_pending = false;
+    fprintf(stdout, "Writing the partition table area (first %" PRId64 " bytes)\n", n);
+    write_at(0, head_buf, n);
+}
+
 /** Push everything written so far to the disk, so the map file never claims more than is stored **/
 static void sync_dst(void)
 {
+    CLEAR_OS_ERROR();
     if(fflush(dst) != 0)
     {
-        die("Failed to Write Destination!");
+        die_write(FTELL(dst), 0, errno);
     }
 #ifdef _WIN32
     _commit(_fileno(dst));
@@ -885,21 +1213,78 @@ static void sync_dst(void)
 #endif
 }
 
-/** Differential mode: true when the destination already holds this data **/
-static bool same_as_dst(_long pos, const char *data, _long len)
+/** Length of the compare block at off, clipped to end **/
+static _long diff_block_len(_long off, _long end)
 {
-    bool same = false;
+    _long n = DIFF_BLOCK;
+    if(n > end - off)
+    {
+        n = end - off;
+    }
+    return n;
+}
+
+/**
+ *  Differential mode: compare the chunk with the destination in DIFF_BLOCK
+ *  pieces and write only the pieces that differ (runs of them in one write).
+ *  What cannot be read back from the destination (it is shorter, or the
+ *  read fails) is written; a failing read is reported once.
+ */
+static void write_differences(_long pos, char *data, _long len)
+{
+    static bool warned = false;
+    _long got = 0;
+    _long cmp_end;
+    _long off = 0;
+    int err = 0;
 
     if(FSEEK(dst, pos, SEEK_SET) == 0)
     {
-        size_t got = fread(tmp2, 1, (size_t)len, dst);
-        if((_long)got == len && memcmp(data, tmp2, (size_t)len) == 0)
-        {
-            same = true;
-        }
+        errno = 0;
+        got = (_long)fread(tmp2, 1, (size_t)len, dst);
+        err = errno;
+    }
+
+    if(got < len && pos + got < g_dst_old_size && !warned)
+    {
+        fprintf(stderr, "\033[93mWarning: differential compare cannot read the destination at %" PRId64 " (%s), writing without compare\033[m\n",
+                pos + got, (err != 0) ? strerror(err) : "short read");
+        warned = true;
     }
     clearerr(dst);
-    return same;
+
+    /* Whole blocks that could be read back are compared, the rest is written */
+    cmp_end = (got == len) ? len : got - (got % DIFF_BLOCK);
+
+    while(off < cmp_end)
+    {
+        _long run;
+        _long n = diff_block_len(off, cmp_end);
+
+        if(memcmp(data + off, tmp2 + off, (size_t)n) == 0)
+        {
+            st_unchanged += n;
+            off += n;
+            continue;
+        }
+
+        run = off;
+        while(off < cmp_end)
+        {
+            n = diff_block_len(off, cmp_end);
+            if(memcmp(data + off, tmp2 + off, (size_t)n) == 0)
+            {
+                break;
+            }
+            off += n;
+        }
+        write_at(pos + run, data + run, off - run);
+    }
+
+    if(cmp_end < len)
+    {
+        write_at(pos + cmp_end, data + cmp_end, len - cmp_end);
+    }
 }
 
 /* Block Mining write-back buffer: collects contiguous sectors, written in big pieces */
@@ -1026,7 +1411,7 @@ static void map_add(badmap_t *m, _long start, _long end, int state)
     if(m->n == m->cap)
     {
         size_t ncap = (m->cap > 0) ? m->cap * 2 : 64;
-        range_t *nr = realloc(m->r, ncap * sizeof(range_t));
+        range_t *nr = (range_t *)realloc(m->r, ncap * sizeof(range_t));
         if(nr == NULL)
         {
             die("Out of memory (map)");
@@ -1506,6 +1891,26 @@ static void map_fit(badmap_t *m, _long extent, _long end)
 /*  Checkpoints                                                        */
 /* ------------------------------------------------------------------ */
 
+/** Mark [0, len) as "not copied yet" in a map (ranges there are replaced) **/
+static void map_mark_nontried_head(badmap_t *m, _long len)
+{
+    badmap_t out = { NULL, 0, 0 };
+    size_t i;
+
+    map_add(&out, 0, len, RS_NONTRIED);
+    for(i = 0; i < m->n; i++)
+    {
+        if(m->r[i].end <= len)
+        {
+            continue;
+        }
+        map_add(&out, (m->r[i].start > len) ? m->r[i].start : len, m->r[i].end, m->r[i].state);
+    }
+
+    map_free(m);
+    *m = out;
+}
+
 static char running_status(void)
 {
     if(phase == PHASE_COPY)
@@ -1551,6 +1956,12 @@ static void checkpoint_tick(_long pos)
     for(j = g_pass_idx + 1; j < g_pass_src->n; j++)
     {
         map_add(&snap, g_pass_src->r[j].start, g_pass_src->r[j].end, g_pass_src->r[j].state);
+    }
+
+    /* The deferred start area of a drive is not on the disk yet: a resumed run must write it */
+    if(head_len > 0 && head_pending)
+    {
+        map_mark_nontried_head(&snap, head_len);
     }
 
     snprintf(result, sizeof(result), "Running Pass %d (checkpoint)", phase);
@@ -1721,8 +2132,6 @@ static void copy_range(_long a, _long b, badmap_t *out)
 
             if(got == rlen)
             {
-                bool skip_write = false;
-
                 if(g_differential)
                 {
 /* A 4yr old's contribution
@@ -1730,10 +2139,9 @@ static void copy_range(_long a, _long b, badmap_t *out)
  ,űŰ
 -> mn;íł v5tcnchfcf vhb7z7hmi ,m,kl nl.é.
 */
-                    skip_write = same_as_dst(pos, tmp, rlen);
+                    write_differences(pos, tmp, rlen);
                 }
-
-                if(!skip_write)
+                else
                 {
                     write_at(pos, tmp, rlen);
                 }
@@ -1962,7 +2370,8 @@ static void usage(const char *prog)
 
     fprintf(stderr, "\033[93mPlease make a backup and test before you start any live operation. This software comes without any warranty.\033[m\n\n");
 
-    fprintf(stderr, "\033[1mUsage: %s [--map mapfile] [source_file] [dest_file] [differential = 0] [throttle = 0] [try = 1] [fill = 00] [skip = 512] [seek = 0] [endpos = 0]\033[m\n", prog);
+    fprintf(stderr, "\033[1mUsage: %s [source_file] [dest_file] [differential = 0] [throttle = 0] [try = 1] [fill = 00] [skip = 512] [seek = 0] [endpos = 0]\033[m\n", prog);
+    fprintf(stderr, "\033[1m       %s [--map mapfile] [source_file] [dest_file] [differential = 0] [throttle = 0] [try = 1] [fill = 00] [skip = 512] [seek = 0] [endpos = 0]\033[m\n", prog);
     fprintf(stderr, "\033[1m       %s --list              (Windows: list physical drives and volumes)\033[m\n\n", prog);
     fprintf(stderr, "\033[93m - --map: (Optional) continue from a map file of an earlier run (pfr or GNU ddrescue format)\n");
     fprintf(stderr, "   | - copied areas are skipped, the rest is copied, scraped and retried; the destination must be the same\n");
@@ -2045,7 +2454,7 @@ int main(int argc, char *argv[])
     fprintf(stderr, "\n\n\033[7m[P]artial [F]ile [R]ecovery Version: %s\033[m\n", VERSION);
 
     /* Take out "--map file", the rest are positional arguments */
-    pargv = malloc(sizeof(char *) * (size_t)(argc + 1));
+    pargv = (char **)malloc(sizeof(char *) * (size_t)(argc + 1));
     if(pargv == NULL)
     {
         die("Out of memory");
@@ -2181,7 +2590,7 @@ int main(int argc, char *argv[])
 
     if(src == NULL)
     {
-        fprintf(stderr, "Unable to open source file for reading: %s\n\n", pargv[1]);
+        fprintf(stderr, "\033[91mUnable to open source file for reading: %s (%s)\033[m\n\n", pargv[1], strerror(errno));
         if(src_is_device)
         {
             fprintf(stderr, "Hint: drive access requires Administrator privileges\n\n");
@@ -2300,16 +2709,20 @@ int main(int argc, char *argv[])
         dst = fopen(pargv[2], "r+b");
         if(dst == NULL)
         {
+            int err = errno;
+
             if(g_differential)
             {
-                fprintf(stderr, "Unable to open destination file for differential writing: %s\n\n", pargv[2]);
+                fprintf(stderr, "\033[91mUnable to open destination file for differential writing: %s (%s)\033[m\n", pargv[2], strerror(err));
+                fprintf(stderr, "Differential mode compares with an existing destination (an earlier copy), it must exist and be writable.\n");
+                fprintf(stderr, "For a first full copy run without differential: %s %s %s\n\n", pargv[0], pargv[1], pargv[2]);
                 fclose(src);
                 return EXIT_FAIL;
             }
 
             if(map_in != NULL)
             {
-                fprintf(stderr, "Unable to open destination file: %s\nWith --map the destination of the earlier run is needed, it holds the copied data.\n\n", pargv[2]);
+                fprintf(stderr, "\033[91mUnable to open destination file: %s (%s)\033[m\nWith --map the destination of the earlier run is needed, it holds the copied data.\n\n", pargv[2], strerror(err));
                 fclose(src);
                 return EXIT_FAIL;
             }
@@ -2317,7 +2730,7 @@ int main(int argc, char *argv[])
             dst = fopen(pargv[2], "wb");
             if(dst == NULL)
             {
-                fprintf(stderr, "Unable to open destination file for writing: %s\n\n", pargv[2]);
+                fprintf(stderr, "\033[91mUnable to open destination file for writing: %s (%s)\033[m\n\n", pargv[2], strerror(errno));
                 fclose(src);
                 return EXIT_FAIL;
             }
@@ -2373,10 +2786,10 @@ int main(int argc, char *argv[])
     /*  Buffers                                                        */
     /* -------------------------------------------------------------- */
 
-    tmp   = abuf_alloc(BUFFCAP);
-    tmp2  = abuf_alloc(BUFFCAP);
-    buff  = abuf_alloc(BUFFCAP);
-    MBUFF = malloc(MBUFFSIZE);
+    tmp   = (char *)abuf_alloc(BUFFCAP);
+    tmp2  = (char *)abuf_alloc(BUFFCAP);
+    buff  = (char *)abuf_alloc(BUFFCAP);
+    MBUFF = (char *)malloc(MBUFFSIZE);
     if(tmp == NULL || tmp2 == NULL || buff == NULL || MBUFF == NULL)
     {
         die("Out of memory");
@@ -2387,6 +2800,17 @@ int main(int argc, char *argv[])
     {
         setvbuf(dst, MBUFF, _IOFBF, MBUFFSIZE);
     }
+
+    /* Physical drive: its partition table area is written last */
+#ifdef _WIN32
+    if(g_dst_disk >= 0)
+    {
+        head_init(dst_size);
+    }
+#endif
+#if PFR_TEST_HEAD > 0
+    head_init(dst_size);
+#endif
 
     if(seek > 0)
     {
@@ -2523,10 +2947,16 @@ int main(int argc, char *argv[])
     /* -------------------------------------------------------------- */
 
     buf_flush();
+    flush_head();                 /* also after Ctrl+C: the partition table area goes to the disk last */
     fclose(src);
 
     /* Buffered data is written here: a failure now (disk full, device gone) must not look like success */
-    io_fail = (fflush(dst) != 0);
+    CLEAR_OS_ERROR();
+    if(fflush(dst) != 0)
+    {
+        die_write(FTELL(dst), 0, errno);
+    }
+    io_fail = 0;
 
 #ifdef _WIN32
     if(dst_is_device)
@@ -2558,6 +2988,16 @@ int main(int argc, char *argv[])
 
         fprintf(stdout, "\nRead OK: %s   Unreadable: %s (%" PRId64 " bytes)   Rescued by Pass 2/3: %s   Failed reads: %" PRId64 "\n",
                 s_read, s_lost, map_unreadable(&map), s_resc, st_read_errors);
+
+        if(g_differential)
+        {
+            char s_same[32];
+            char s_wr[32];
+
+            format_size(st_unchanged, s_same, sizeof(s_same));
+            format_size(st_written, s_wr, sizeof(s_wr));
+            fprintf(stdout, "Differential: %s already identical (not written), %s written\n", s_same, s_wr);
+        }
     }
 
     /* Final map file */
